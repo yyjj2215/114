@@ -1,0 +1,517 @@
+---
+title: "chicago"
+output:
+  html_document: default
+  word_document: default
+date: "2022-12-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1.loading packages
+```{r}
+library(tidyverse)
+library(tmap)
+library(spdep)
+library(plotly)
+library(rgdal)
+library(broom)
+library(mapview)
+library(crosstalk)
+library(sf)
+library(sp)
+library(spdep)
+library(car)
+library(fs)
+library(janitor)
+library(dplyr)
+```
+
+
+# 2. read data
+```{r}
+# read shapefile
+chicago_shape<-st_read(here::here("shape","geo_export_dffff05e-477e-4cf2-b94c-8a3b293c84f4.shp"))
+
+#potential factors for crimes
+socioeconomic_factors <- read_csv(here::here("Census_Data_-_Selected_socioeconomic_indicators_in_Chicago__2008___2012.csv"), 
+                         na = c(" ", "NA", "n/a"), 
+                         col_names = TRUE, 
+                         locale = locale(encoding = 'Latin1'))%>%
+  clean_names()
+#crime data 
+chicago_crime <- read_csv(here::here("Crimes2010.csv"), 
+                         na = c(" ", "NA", "n/a"), 
+                         col_names = TRUE, 
+                         locale = locale(encoding = 'Latin1'))%>%
+  clean_names()
+```
+
+```{r}
+qtm(chicago_shape)
+```
+#3. data processing 
+```{r}
+socioeconomic_factors<-socioeconomic_factors%>%
+  dplyr::filter(., !is.na(community_area_number))
+# remove na
+chicago_crime<-chicago_crime%>%
+  dplyr::filter(., !is.na(longitude))%>%
+  dplyr::filter(., !is.na(latitude))
+```
+```{r}
+# check all of the columns have been read in correctly 
+Datatypelist1 <- chicago_crime %>% 
+  summarise_all(class) %>%
+  pivot_longer(everything(), 
+               names_to="All_variables", 
+               values_to="Variable_class")
+Datatypelist1
+```
+
+```{r}
+#check all of the columns have been read in correctly 
+Datatypelist2 <- socioeconomic_factors %>% 
+  summarise_all(class) %>%
+  pivot_longer(everything(), 
+               names_to="All_variables", 
+               values_to="Variable_class")
+
+Datatypelist2
+```
+```{r}
+# select burglary data
+chicago_crime_reduce<-chicago_crime%>%
+#  filter(str_detect(date,"^01"))%>%
+  filter(primary_type=="BURGLARY")%>%
+  filter(arrest=="TRUE")
+```
+
+```{r}
+# correct crs
+chicago_crime_sf<-st_as_sf(chicago_crime_reduce,
+                          coords = c("longitude","latitude"),
+                          crs = 4326)
+# remove duplicates
+chicago_crime_sf<-distinct(chicago_crime_sf)
+```
+
+```{r}
+# plot crime points on the map 
+tmap_mode("plot")
+tm_shape(chicago_shape)+
+  tm_polygons(col=NA,alpha = 1)+
+tm_shape(chicago_crime_sf)+
+  tm_dots(col="purple")
+```
+# make sure all points within Chicago boundary
+```{r}
+chicago_shape<-chicago_shape%>%
+  st_transform(.,26971)
+```
+
+```{r}
+chicago_crime_sf<-chicago_crime_sf%>%
+  st_transform(.,26971)
+```
+
+```{r}
+chicago_crime_sf<-chicago_crime_sf[chicago_shape,]
+```
+
+# calculate density of crime points
+```{r}
+library(sf)
+chicago_points_sf_joined <- chicago_shape%>%
+  mutate(n = lengths(st_intersects(., chicago_crime_sf)))%>%
+  janitor::clean_names()%>%
+  #calculate area
+  mutate(area=st_area(.))%>%
+  #then density of the points per ward
+  mutate(density=n/area)
+```
+
+
+```{r}
+# plot density map 
+tm_shape(chicago_points_sf_joined) +
+    tm_polygons("density",
+        style="jenks",
+        palette="PuOr",
+        midpoint=NA,
+        popup.vars=c("wardname", "density"),
+        title="Crime Density N/m2")+
+  tm_layout(legend.position = c(0.02,0.08))+
+  tm_scale_bar(position = c(0.02, 0.01), size = 0.5,text.size = .75)+
+  tm_compass(position = c(0.85, 0.8))
+```
+# point pattern analysis (kernal denisty)
+```{r}
+library(spatstat)
+```
+
+```{r}
+#now set a window as the borough boundary
+window <- as.owin(chicago_shape)
+plot(window)
+```
+```{r}
+#create a sp object
+chicago_sub<- chicago_crime_sf %>%
+  as(., 'Spatial')
+#create a ppp object
+chicago_sub.ppp <- ppp(x=chicago_sub@coords[,1],
+                          y=chicago_sub@coords[,2],
+                          window=window)
+```
+
+```{r}
+chicago_sub.ppp %>%
+  density(., sigma=1000) %>%
+  plot()
+```
+
+# calculate weight matrix 
+```{r}
+library(spdep)
+```
+
+```{r}
+coordsW <- chicago_points_sf_joined%>%
+  st_centroid()%>%
+  st_geometry()
+  
+plot(coordsW,axes=TRUE)
+#create a neighbours list
+LWard_nb <- chicago_points_sf_joined %>%
+  poly2nb(., queen = F)
+
+```
+```{r}
+summary(LWard_nb)
+```
+```{r}
+#plot them
+plot(LWard_nb, st_geometry(coordsW), col="red")
+#add a map underneath
+plot(chicago_points_sf_joined$geometry, add=T)
+```
+
+```{r}
+Lward.lw <- LWard_nb %>%
+  nb2listw(., style="W")
+```
+
+# Global Moran's I for density of crimes 
+```{r}
+I_LWard_Global_Density <- chicago_points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  moran.test(., Lward.lw)
+
+I_LWard_Global_Density
+```
+# Local Moran's I for density of crimes 
+```{r}
+I_LWard_Local_Density <- chicago_points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  localmoran(., Lward.lw)%>%
+  as_tibble()
+slice_head(I_LWard_Local_Density, n=5)
+```
+
+```{r}
+chicago_points_sf_joined <- chicago_points_sf_joined %>%
+  mutate(density_I =as.numeric(I_LWard_Local_Density$Ii))%>%
+  mutate(density_Iz =as.numeric(I_LWard_Local_Density$Z.Ii))
+```
+
+```{r}
+breaks1<-c(-1000,-2.58,-1.96,-1.65,1.65,1.96,2.58,1000)
+```
+
+```{r}
+library(RColorBrewer)
+MoranColours<- rev(brewer.pal(8, "RdGy"))
+```
+
+```{r}
+# plot local Moran's I map
+tm_shape(chicago_points_sf_joined) +
+    tm_polygons("density_Iz",
+        style="fixed",
+        breaks=breaks1,
+        palette=MoranColours,
+        midpoint=NA,
+        title="Local Moran's I, Density of Burglary")+
+  tm_layout(legend.position = c(0.02,0.07),legend.title.size = 0.6, legend.text.size=.6)+
+  tm_scale_bar(position = c(0.02, 0.005), size = 0.5,text.size = .75)+
+  tm_compass(position = c(0.85, 0.8))
+```
+
+# descriptive analysis
+```{r}
+chicago_points_sf_joined$scale_density <- scale(chicago_points_sf_joined$density)
+```
+```{r}
+chicago_points_sf_joined$lag_scale_density <- lag.listw(Lward.lw, chicago_points_sf_joined$scale_density)
+```
+
+```{r}
+chicago_oas_moran_stats <- st_as_sf(chicago_points_sf_joined)
+```
+
+```{r}
+# set a significance value
+sig_level <- 0.1
+
+# classification with significance value
+chicago_oas_moran_stats$quad_sig <- ifelse(chicago_oas_moran_stats$scale_density > 0 & 
+                                          chicago_oas_moran_stats$lag_scale_density > 0 & 
+                                          I_LWard_Local_Density[,5] <= sig_level, 
+                                          'high-high', 
+                                   ifelse(chicago_oas_moran_stats$scale_density <= 0 & 
+                                          chicago_oas_moran_stats$lag_scale_density <= 0 & 
+                                          I_LWard_Local_Density[,5] <= sig_level, 
+                                          'low-low', 
+                                   ifelse(chicago_oas_moran_stats$scale_density > 0 & 
+                                          chicago_oas_moran_stats$lag_scale_density <= 0 & 
+                                          I_LWard_Local_Density[,5] <= sig_level, 
+                                          'high-low', 
+                                   ifelse(chicago_oas_moran_stats$scale_density <= 0 & 
+                                          chicago_oas_moran_stats$lag_scale_density > 0 & 
+                                          I_LWard_Local_Density[,5] <= sig_level, 
+                                          'low-high',
+                                   ifelse(I_LWard_Local_Density[,5] > sig_level, 
+                                          'not-significant', 
+                                          'not-significant')))))
+
+# classification without significance value
+chicago_oas_moran_stats$quad_non_sig <- ifelse(chicago_oas_moran_stats$scale_density > 0 & 
+                                              chicago_oas_moran_stats$lag_scale_density > 0, 
+                                              'high-high', 
+                                       ifelse(chicago_oas_moran_stats$scale_density <= 0 & 
+                                              chicago_oas_moran_stats$lag_scale_density <= 0, 
+                                              'low-low', 
+                                       ifelse(chicago_oas_moran_stats$scale_density > 0 & 
+                                              chicago_oas_moran_stats$lag_scale_density <= 0, 
+                                              'high-low', 
+                                       ifelse(chicago_oas_moran_stats$scale_density <= 0 & 
+                                              chicago_oas_moran_stats$lag_scale_density > 0,
+                                              'low-high',NA))))
+```
+
+```{r}
+# plot 1
+# plot the results without the statistical significance
+ggplot(chicago_oas_moran_stats, aes(x = scale_density, 
+                                   y = lag_scale_density, 
+                                   color = quad_non_sig)) +
+  geom_vline(xintercept = 0) + # plot vertical line
+  geom_hline(yintercept = 0) + # plot horizontal line
+  xlab('Scaled Crime Density') +
+  ylab('Lagged Scaled Crime Density') +
+  labs(colour='Relative to neighbours') +
+  geom_point()
+```
+
+```{r}
+# plot 2
+# plot the results with the statistical significance
+ggplot(chicago_oas_moran_stats, aes(x = scale_density, 
+                                   y = lag_scale_density, 
+                                   color = quad_sig)) +
+  geom_vline(xintercept = 0) + # plot vertical line
+  geom_hline(yintercept = 0) + # plot horizontal line
+  xlab('Scaled Crime Density') +
+  ylab('Lagged Scaled Crime Density') +
+  labs(colour='Relative to neighbours') +
+  geom_point()
+```
+
+```{r}
+# map all of the results here
+tm_shape(chicago_oas_moran_stats) +
+    tm_fill(col = 'quad_non_sig', palette = c("#de2d26", "#fee0d2", "#deebf7", "#3182bd"))+
+   tm_layout(legend.position = c(0.02,0.08))+
+  tm_scale_bar(position = c(0.02, 0.005), size = 0.5,text.size = .75)+
+  tm_compass(position = c(0.85, 0.8))
+```
+
+```{r}
+# map only the statistically significant results here
+# map only the statistically significant results here
+tm_shape(chicago_oas_moran_stats) +
+    tm_fill(col = 'quad_sig', palette = c("#de2d26", "#fee0d2", "white")) +
+    tm_borders(col = "grey")+
+   tm_layout(legend.position = c(0.02,0.08))+
+  tm_scale_bar(position = c(0.02, 0.005), size = 0.5,text.size = .75)+
+  tm_compass(position = c(0.85, 0.8))
+```
+
+
+# use socoeconomic factors to do regression analysis
+```{r}
+density_data<-chicago_points_sf_joined%>%
+  dplyr::select(area_num_1,density)%>%
+  st_drop_geometry()
+```
+
+```{r}
+density_data<-density_data%>%
+  dplyr::mutate(density=round(as.numeric(density)*10000000+1,3))%>%
+  dplyr::mutate(code=as.numeric(area_num_1))
+```
+
+```{r}
+regression_data<-socioeconomic_factors%>%
+  left_join(.,
+            density_data,
+            by=c("community_area_number"="code"))
+```
+
+# descpritive varibales
+```{r}
+regression_data%>%
+dplyr::select(density)%>%
+  pull()%>%
+  qplot()+ 
+  geom_histogram() 
+```
+```{r}
+regression_data%>%
+dplyr::select(percent_households_below_poverty)%>%
+  pull()%>%
+  qplot()+ 
+  geom_histogram() 
+```
+
+```{r}
+regression_data%>%
+dplyr::select(per_capita_income)%>%
+  pull()%>%
+  qplot()+ 
+  geom_histogram() 
+```
+
+```{r}
+regression_data%>%
+dplyr::select(percent_aged_16_unemployed)%>%
+  pull()%>%
+  qplot()+ 
+  geom_histogram() 
+```
+
+```{r}
+regression_data%>%
+dplyr::select(percent_aged_25_without_high_school_diploma)%>%
+  pull()%>%
+  qplot()+ 
+  geom_histogram() 
+```
+
+```{r}
+regression_data%>%
+dplyr::select(percent_of_housing_crowded)%>%
+  pull()%>%
+  qplot()+ 
+  geom_histogram() 
+```
+
+```{r}
+modelMLR <- lm(log(density) ~ log(percent_households_below_poverty)+log(percent_of_housing_crowded)+log(percent_aged_25_without_high_school_diploma)+log(percent_aged_16_unemployed)+log(per_capita_income), data = regression_data)
+summary(modelMLR)
+```
+
+```{r}
+chicago_points_sf_joined$residuals<-modelMLR$residuals
+```
+
+
+# residuals的map
+```{r}
+tm_shape(chicago_points_sf_joined) + tm_fill("residuals", style = "cont", palette = "-RdBu") +
+tm_shape(chicago_shape) + tm_polygons(alpha = 0, border.alpha = 1, border.col = "black") +
+tm_compass(position = c(0.85, 0.8)) +
+tm_scale_bar(position = c(0.05, 0.005)) +
+tm_layout(frame = FALSE, legend.title.size = 0.5, legend.text.size = 0.5)+
+   tm_layout(legend.position = c(0.05,0.08))
+```
+# Global Moran's I for residuals
+```{r}
+#generate unique number for each row
+chicago_points_sf_joined$ROWNUM <- 1:nrow(chicago_points_sf_joined)
+# We need to coerce the sf spatialdatafile object into a new sp object
+spatialdatafile_2.0 <- as(chicago_points_sf_joined, "Spatial")
+# Create spatial weights matrix for areas
+Weights <- poly2nb(spatialdatafile_2.0, row.names = spatialdatafile_2.0$ROWNUM)
+WeightsMatrix <- nb2mat(Weights, style='B')
+Residual_WeightMatrix <- mat2listw(WeightsMatrix , style='W')
+# Run the test on the regression model output object "modelMLR" using lm.morantest()
+lm.morantest(modelMLR, Residual_WeightMatrix, alternative="two.sided")
+```
+
+```{r}
+descrptive_variables<-socioeconomic_factors[,c('per_capita_income','percent_households_below_poverty','percent_aged_25_without_high_school_diploma','percent_aged_16_unemployed','percent_of_housing_crowded')]
+descrptive_variables2<-log(descrptive_variables)
+```
+
+
+
+```{r}
+par(las = 1) # all axis labels horizontal
+
+boxplot(as.data.frame(descrptive_variables2), main ="All Socialeconomic Factors",
+
+      horizontal = TRUE)
+```
+
+```{r}
+boxplot(as.data.frame(descrptive_variables2), main ="All Socialeconomic Factors")
+```
+
+```{r}
+library(patchwork)
+```
+
+```{r}
+p1<-ggplot(descrptive_variables2, 
+                 aes(x=per_capita_income)) + 
+  geom_histogram(color="black", 
+                 fill="white")+
+  labs(
+       x="income", 
+       y="Frequency")
+p2<-ggplot(descrptive_variables2, 
+                 aes(x=percent_households_below_poverty)) + 
+  geom_histogram(color="black", 
+                 fill="white")+
+  labs( 
+       x="households below poverty", 
+       y="Frequency")
+p3<-ggplot(descrptive_variables2, 
+                 aes(x=percent_aged_25_without_high_school_diploma)) + 
+  geom_histogram(color="black", 
+                 fill="white")+
+  labs(
+       x="high school without diploma", 
+       y="Frequency")
+p4<-ggplot(descrptive_variables2, 
+                 aes(x=percent_aged_16_unemployed)) + 
+  geom_histogram(color="black", 
+                 fill="white")+
+  labs( 
+       x="unemploy", 
+       y="Frequency")
+p5<-ggplot(descrptive_variables2, 
+                 aes(x=percent_of_housing_crowded)) + 
+  geom_histogram(color="black", 
+                 fill="white")+
+  labs( 
+       x="housing crowded", 
+       y="Frequency")
+p1+p2+p3+p4+p5+plot_layout(ncol=3)
+```
